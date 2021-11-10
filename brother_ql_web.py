@@ -6,6 +6,7 @@ This is a web service to print labels on Brother QL label printers.
 """
 
 import sys, logging, random, json, argparse
+from datetime import datetime
 from io import BytesIO
 
 from bottle import run, route, get, post, response, request, jinja2_view as view, static_file, redirect
@@ -60,8 +61,8 @@ def get_label_context(request):
       'font_size': int(d.get('font_size', 100)),
       'font_family':   font_family,
       'font_style':    font_style,
-      'label_size':    d.get('label_size', "62"),
-      'kind':          label_type_specs[d.get('label_size', "62")]['kind'],
+      'label_size':    d.get('label_size', "23x23"),
+      'kind':          label_type_specs[d.get('label_size', "23x23")]['kind'],
       'margin':    int(d.get('margin', 10)),
       'threshold': int(d.get('threshold', 70)),
       'align':         d.get('align', 'center'),
@@ -70,6 +71,9 @@ def get_label_context(request):
       'margin_bottom': float(d.get('margin_bottom', 45))/100.,
       'margin_left':   float(d.get('margin_left',   35))/100.,
       'margin_right':  float(d.get('margin_right',  35))/100.,
+      'grocycode': d.get('grocycode', None),
+      'product': d.get('product', None),
+      'duedate': d.get('due_date', None)
     }
     context['margin_top']    = int(context['font_size']*context['margin_top'])
     context['margin_bottom'] = int(context['font_size']*context['margin_bottom'])
@@ -145,6 +149,102 @@ def create_label_im(text, **kwargs):
     draw.multiline_text(offset, text, kwargs['fill_color'], font=im_font, align=kwargs['align'])
     return im
 
+def create_label_grocy(text, **kwargs):
+    product = kwargs['product']
+    duedate = kwargs['duedate']
+    grocycode = kwargs['grocycode']
+
+    barcode_width = 120
+    barcode_height = 120
+    # prepare grocycode datamatrix
+    from pylibdmtx.pylibdmtx import encode
+    encoded = encode(grocycode.encode('utf8'), size="SquareAuto") # adjusted for 300x300 dpi - results in DM code roughly 5x5mm
+    datamatrix = Image.frombytes('RGB', (encoded.width, encoded.height), encoded.pixels).resize((barcode_height, barcode_width), resample=Image.BICUBIC)
+
+    product_font = ImageFont.truetype(kwargs['font_path'], 30)
+    duedate_font = ImageFont.truetype(kwargs['font_path'], 30)
+    duedate_year_font = ImageFont.truetype(kwargs['font_path'], 45)
+    width = 225
+    height = 225
+    if kwargs['orientation'] == 'rotated':
+        tw = width
+        width = height
+        height = tw
+
+    im = Image.new('RGB', (width, height), 'white')
+    draw = ImageDraw.Draw(im)
+    print(kwargs['orientation'])
+    if kwargs['orientation'] == 'standard':
+        vertical_offset = 0 #kwargs['margin_top']
+        horizontal_offset = 0 #kwargs['margin_left']
+    elif kwargs['orientation'] == 'rotated':
+        vertical_offset = kwargs['margin_top']
+        horizontal_offset = kwargs['margin_left']
+        datamatrix.transpose(Image.ROTATE_270)
+
+    # im.paste(datamatrix, (horizontal_offset, vertical_offset, horizontal_offset + encoded.width, vertical_offset + encoded.height))
+    im.paste(datamatrix, (horizontal_offset, vertical_offset, horizontal_offset + barcode_width, vertical_offset + barcode_height))
+
+    if kwargs['orientation'] == 'standard':
+        vertical_offset = 0
+        horizontal_offset = barcode_width
+    elif kwargs['orientation'] == 'rotated':
+        vertical_offset += barcode_width + 40
+        horizontal_offset += -10
+
+
+    if duedate is not None:
+        textoffset = horizontal_offset, vertical_offset
+        duedate=duedate.replace('DD: ', '')
+        d = datetime.strptime(duedate, '%Y-%m-%d')
+        
+        draw.text(textoffset, d.strftime('%Y'), kwargs['fill_color'], font=duedate_year_font)
+        vertical_offset += duedate_year_font.getsize(d.strftime('%Y'))[1] + 15
+        textoffset = horizontal_offset, vertical_offset
+        draw.text(textoffset, d.strftime('%b %d'), kwargs['fill_color'], font=duedate_font)
+        if kwargs['orientation'] == 'standard':
+            vertical_offset = barcode_height
+            horizontal_offset = 0 #kwargs['margin_left']
+        elif kwargs['orientation'] == 'rotated':
+            vertical_offset = kwargs['margin_left']
+            horizontal_offset += 110
+
+    draw_word_wrap(draw, product, max_width=width, xpos=0, ypos=barcode_height, fill=kwargs['fill_color'], font=product_font)
+
+    return im
+
+def draw_word_wrap(draw, text,
+                   xpos=0, ypos=0,
+                   max_width=130,
+                   fill=(250,0,0),
+                   font=None):
+    '''Draw the given ``text`` to the x and y position of the image, using
+    the minimum length word-wrapping algorithm to restrict the text to
+    a pixel width of ``max_width.``
+    '''
+    text_size_x, text_size_y = draw.textsize(text, font=font)
+    remaining = max_width
+    space_width, space_height = draw.textsize(' ', font=font)
+    # use this list as a stack, push/popping each line
+    output_text = []
+    # split on whitespace...    
+    for word in text.split(None):
+        word_width, word_height = draw.textsize(word, font=font)
+        if word_width + space_width > remaining:
+            output_text.append(word)
+            remaining = max_width - word_width
+        else:
+            if not output_text:
+                output_text.append(word)
+            else:
+                output = output_text.pop()
+                output += ' %s' % word
+                output_text.append(output)
+            remaining = remaining - (word_width + space_width)
+    for text in output_text:
+        draw.text((xpos, ypos), text, font=font, fill=fill)
+        ypos += text_size_y
+
 @get('/api/preview/text')
 @post('/api/preview/text')
 def get_preview_image():
@@ -164,6 +264,56 @@ def image_to_png_bytes(im):
     im.save(image_buffer, format="PNG")
     image_buffer.seek(0)
     return image_buffer.read()
+
+@post('/api/print/grocy')
+@get('/api/print/grocy')
+def print_grocy():
+    """
+    API endpoint to consume the grocy label webhook.
+
+    returns; JSON
+    """
+
+    return_dict = {'success' : False }
+
+    try:
+        context = get_label_context(request)
+    except LookupError as e:
+        return_dict['error'] = e.msg
+        return return_dict
+
+    if context['product'] is None:
+        return_dict['error'] = 'Please provide the product for the label'
+        return return_dict
+
+    im = create_label_grocy(**context)
+    if DEBUG: im.save('sample-out.png')
+
+    if context['kind'] == ENDLESS_LABEL:
+        rotate = 0 if context['orientation'] == 'standard' else 90
+    elif context['kind'] in (ROUND_DIE_CUT_LABEL, DIE_CUT_LABEL):
+        rotate = 'auto'
+
+    qlr = BrotherQLRaster(CONFIG['PRINTER']['MODEL'])
+    red = False
+    if 'red' in context['label_size']:
+        red = True
+    create_label(qlr, im, context['label_size'], red=red, threshold=context['threshold'], cut=False, rotate=rotate)
+
+    if not DEBUG:
+        try:
+            be = BACKEND_CLASS(CONFIG['PRINTER']['PRINTER'])
+            be.write(qlr.data)
+            be.dispose()
+            del be
+        except Exception as e:
+            return_dict['message'] = str(e)
+            logger.warning('Exception happened: %s', e)
+            return return_dict
+
+    return_dict['success'] = True
+    if DEBUG: return_dict['data'] = str(qlr.data)
+    return return_dict
 
 @post('/api/print/text')
 @get('/api/print/text')
